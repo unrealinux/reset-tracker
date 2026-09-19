@@ -1,22 +1,27 @@
 #!/usr/bin/env node
 /**
- * One command from a local checkout to a public HTTPS URL you can share.
+ * Publishes the local site on a public HTTPS URL, and keeps it up.
  *
- *   npm run demo                                  # build if needed, serve, tunnel
- *   npm run demo -- --no-build                    # reuse the last build
- *   npm run demo -- --subdomain whenreset         # stable name (serveo: needs a registered key)
- *   TUNNEL_PROVIDER=localhost.run npm run demo    # use the other relay
+ *   npm run demo                          # auto: try the fixed name, fall back
+ *   npm run demo -- --subdomain whenreset # preferred subdomain on serveo
+ *   npm run demo -- --no-build            # reuse the last build
+ *   TUNNEL_PROVIDER=serveo npm run demo   # force one relay
  *
- * The tunnel is kept alive: if the relay drops the session, this reconnects and
- * rewrites SITE_URL, restarting the local server so canonical links and OG
- * images always point at the live address.
+ * Behaviour
+ *   - Tries the preferred subdomain first when one is configured.
+ *   - If the relay refuses it (rate limit, name taken), falls back to a random
+ *     address on the same relay, then to the next relay in the list, so you
+ *     always end up with *something* shareable.
+ *   - Retries the preferred subdomain every few minutes in the background and
+ *     switches back as soon as it is accepted.
+ *   - Rewrites SITE_URL whenever the address changes and restarts the server,
+ *     so canonical links, OG images and feeds never point at a dead host.
  *
  * Secrets are generated into .env.local when missing, so a published site never
  * keeps the development password.
  *
- * This is for showing the site to people, not for production: it needs this
- * machine to stay on. For a permanent address see the Deployment section of the
- * README (Zeabur / a VPS).
+ * This needs this machine to stay on. For a permanent address see the
+ * Deployment section of the README (Zeabur / a VPS).
  */
 
 import { spawn } from "node:child_process";
@@ -28,31 +33,40 @@ const root = process.cwd();
 const envFile = path.join(root, ".env.local");
 const port = process.env.PORT ?? "3000";
 const skipBuild = process.argv.includes("--no-build");
+
 const subdomainArg = process.argv.indexOf("--subdomain");
-const subdomain =
+const preferredSubdomain =
   subdomainArg >= 0 ? process.argv[subdomainArg + 1] : (process.env.TUNNEL_SUBDOMAIN ?? "");
 
-const PROVIDERS = {
+const RETRY_PREFERRED_MS = 5 * 60_000;
+const RECONNECT_DELAY_MS = 5_000;
+
+const RELAYS = {
   serveo: {
     label: "serveo.net",
     pattern: /https:\/\/[a-z0-9-]+\.serveousercontent\.com|https:\/\/[a-z0-9-]+\.serveo\.net/,
-    args: (sub) => [...(sub ? ["-R", `${sub}:80:localhost:${port}`] : ["-R", `80:localhost:${port}`]), "serveo.net"],
+    args: (sub) =>
+      sub
+        ? ["-R", `${sub}:80:localhost:${port}`, "serveo.net"]
+        : ["-R", `80:localhost:${port}`, "serveo.net"],
   },
   "localhost.run": {
     label: "localhost.run",
     pattern: /https:\/\/[a-z0-9-]+\.lhr\.life/,
-    args: (sub) => [
-      ...(sub ? ["-R", `${sub}:80:localhost:${port}`] : ["-R", `80:localhost:${port}`]),
-      "nokey@localhost.run",
-    ],
+    args: (sub) =>
+      sub
+        ? ["-R", `${sub}:80:localhost:${port}`, "nokey@localhost.run"]
+        : ["-R", `80:localhost:${port}`, "nokey@localhost.run"],
   },
 };
 
-const providerName = process.env.TUNNEL_PROVIDER ?? "serveo";
-const provider = PROVIDERS[providerName];
-if (!provider) {
-  console.error(`Unknown TUNNEL_PROVIDER "${providerName}". Use serveo or localhost.run.`);
-  process.exit(1);
+const forced = process.env.TUNNEL_PROVIDER;
+const relayOrder = forced ? [forced] : ["serveo", "localhost.run"];
+for (const name of relayOrder) {
+  if (!RELAYS[name]) {
+    console.error(`Unknown TUNNEL_PROVIDER "${name}". Use serveo or localhost.run.`);
+    process.exit(1);
+  }
 }
 
 // --- .env.local --------------------------------------------------------------
@@ -136,14 +150,15 @@ process.on("SIGINT", () => shutdown(0));
 process.on("SIGTERM", () => shutdown(0));
 
 function run(command, args) {
-  // No `shell: true`: it concatenates arguments instead of escaping them, and on
-  // Windows spawning `npm.cmd` that way fails outright.
+  // No `shell: true`: it concatenates arguments instead of escaping them, and
+  // spawning `npm.cmd` that way fails on Windows with EINVAL.
   const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
   children.push(child);
   return child;
 }
 
 const nextBin = path.join(root, "node_modules", "next", "dist", "bin", "next");
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function waitForServer(url, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
@@ -154,7 +169,7 @@ async function waitForServer(url, timeoutMs = 60_000) {
     } catch {
       /* not up yet */
     }
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    await sleep(1500);
   }
   return false;
 }
@@ -165,11 +180,10 @@ async function startServer() {
     const text = d.toString();
     if (!/EADDRINUSE/.test(text)) process.stderr.write(`    ${text}`);
   });
-  const ok = await waitForServer(`http://localhost:${port}/api/health`);
-  return ok ? child : null;
+  return (await waitForServer(`http://localhost:${port}/api/health`)) ? child : null;
 }
 
-/** Kills the server and waits for the port to actually free up before rebinding. */
+/** Kills the server and waits for the port to actually free before rebinding. */
 async function stopServer(child) {
   if (!child) return;
   killTree(child);
@@ -182,8 +196,72 @@ async function stopServer(child) {
       .then(() => true)
       .catch(() => false);
     if (!alive) return;
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await sleep(500);
   }
+}
+
+/** Opens one relay session. Resolves with its public URL, or null. */
+function openTunnel(relay, subdomain) {
+  return new Promise((resolve) => {
+    const tunnel = run("ssh", [
+      "-o",
+      "StrictHostKeyChecking=accept-new",
+      "-o",
+      "ServerAliveInterval=20",
+      "-o",
+      "ServerAliveCountMax=3",
+      "-o",
+      "ExitOnForwardFailure=yes",
+      "-T",
+      ...relay.args(subdomain),
+    ]);
+
+    let buffer = "";
+    let settled = false;
+    const finish = (url) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ process: tunnel, url });
+    };
+    const timer = setTimeout(() => finish(null), 40_000);
+
+    const inspect = (chunk) => {
+      buffer += chunk.toString();
+      if (subdomain && /only allowed|not available|already in use|denied/i.test(buffer)) {
+        console.log(`    ${relay.label} 拒绝子域名 "${subdomain}"`);
+      }
+      const match = buffer.match(relay.pattern);
+      if (match) finish(match[0]);
+    };
+
+    tunnel.stdout.on("data", inspect);
+    tunnel.stderr.on("data", inspect);
+    tunnel.on("exit", () => finish(null));
+  });
+}
+
+/**
+ * Walks the relay list until one accepts a session. The preferred subdomain is
+ * attempted first only while we are not already using it.
+ */
+async function acquireTunnel({ allowPreferred }) {
+  for (const name of relayOrder) {
+    const relay = RELAYS[name];
+
+    if (allowPreferred && preferredSubdomain) {
+      const attempt = await openTunnel(relay, preferredSubdomain);
+      if (attempt.url && attempt.url.includes(preferredSubdomain)) {
+        return { ...attempt, relay, fixed: true };
+      }
+      if (attempt.process) killTree(attempt.process);
+    }
+
+    const random = await openTunnel(relay, "");
+    if (random.url) return { ...random, relay, fixed: false };
+    if (random.process) killTree(random.process);
+  }
+  return null;
 }
 
 // --- main --------------------------------------------------------------------
@@ -204,81 +282,57 @@ if (!skipBuild || !hasBuild) {
   console.log("2/4 使用已有构建产物（--no-build）");
 }
 
-console.log(`3/4 公网隧道 (${provider.label})`);
-
-/** Opens one tunnel session; resolves with its URL, or null if it never came up. */
-function openTunnel() {
-  return new Promise((resolve) => {
-    const tunnel = run("ssh", [
-      "-o",
-      "StrictHostKeyChecking=accept-new",
-      "-o",
-      "ServerAliveInterval=20",
-      "-o",
-      "ServerAliveCountMax=3",
-      "-o",
-      "ExitOnForwardFailure=yes",
-      "-T",
-      ...provider.args(subdomain),
-    ]);
-
-    let buffer = "";
-    let settled = false;
-    const finish = (url) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ process: tunnel, url });
-    };
-    const timer = setTimeout(() => finish(null), 45_000);
-
-    const inspect = (chunk) => {
-      buffer += chunk.toString();
-      if (!subdomain && /register your SSH public key/i.test(buffer)) {
-        const link = buffer.match(/https:\/\/console\.serveo\.net\/ssh\/keys[^\s]*/);
-        if (link) {
-          console.log("    想让地址固定下来？注册这个 key（用手机完成登录即可）:");
-          console.log(`    ${link[0]}`);
-        }
-      }
-      const match = buffer.match(provider.pattern);
-      if (match) finish(match[0]);
-    };
-
-    tunnel.stdout.on("data", inspect);
-    tunnel.stderr.on("data", inspect);
-    tunnel.on("exit", () => finish(null));
-  });
+if (preferredSubdomain) {
+  console.log(`3/4 公网隧道（优先固定域名 "${preferredSubdomain}"，被拒则自动降级）`);
+} else {
+  console.log(`3/4 公网隧道（随机地址；加 --subdomain 名字 可固定）`);
 }
 
 let server = null;
 let currentUrl = null;
+let lastPreferredAttempt = 0;
+let usingFixed = false;
 
 console.log("4/4 启动服务并对外发布");
 for (;;) {
-  const { process: tunnel, url } = await openTunnel();
+  // Retry the nicer address periodically while running on a random one.
+  const allowPreferred =
+    Boolean(preferredSubdomain) &&
+    (!usingFixed || currentUrl === null) &&
+    Date.now() - lastPreferredAttempt > RETRY_PREFERRED_MS;
+  if (allowPreferred) lastPreferredAttempt = Date.now();
 
-  if (!url) {
-    console.error("    隧道建立失败，10 秒后重试（可换后端：TUNNEL_PROVIDER=localhost.run npm run demo）");
-    await new Promise((resolve) => setTimeout(resolve, 10_000));
+  const acquired = await acquireTunnel({ allowPreferred });
+
+  if (!acquired) {
+    console.error("    所有 relay 均不可用，15 秒后重试（常见原因：临时限流）");
+    await sleep(15_000);
     continue;
   }
 
-  // Each relay session gets a fresh address, so SITE_URL has to follow it or
-  // canonical links and OG images would point at the dead one.
+  const { process: tunnel, url, relay, fixed } = acquired;
+  usingFixed = fixed;
+
   if (url !== currentUrl) {
+    const previous = currentUrl;
     currentUrl = url;
     const fresh = readEnvFile();
     fresh.SITE_URL = url;
     writeEnvFile(fresh);
-    await stopServer(server);
-    server = await startServer();
+
+    if (!server) {
+      server = await startServer();
+    } else if (previous) {
+      // Address changed: restart so canonical/OG/feeds reflect the live host.
+      await stopServer(server);
+      server = await startServer();
+    }
   }
 
   if (!server) {
     console.error("    本地服务未能就绪，10 秒后重试");
     killTree(tunnel);
-    await new Promise((resolve) => setTimeout(resolve, 10_000));
+    await sleep(10_000);
     continue;
   }
 
@@ -286,8 +340,9 @@ for (;;) {
     .then((r) => r.json())
     .catch(() => null);
 
-  console.log(`\n${"=".repeat(70)}`);
+  console.log(`\n${"=".repeat(72)}`);
   console.log(`  现在就发给别人   ${url}`);
+  console.log(`  地址类型         ${fixed ? `固定域名（${preferredSubdomain}）` : `临时随机地址 · ${relay.label}`}`);
   console.log(`  管理后台         ${url}/admin`);
   console.log(`  后台密码         ${env.ADMIN_PASSWORD}`);
   console.log(`  API 文档         ${url}/api/docs`);
@@ -296,11 +351,12 @@ for (;;) {
       `  数据             ${health.providers.map((p) => `${p.id} ${p.records}`).join(" · ")}`,
     );
   }
-  console.log("=".repeat(70));
-  console.log("\n隧道断开会自动重连（届时地址会变，重新看这里）。保持本窗口开着，Ctrl+C 结束。");
-  console.log("要一个永不改变的地址：README 的 Deployment 章节（Zeabur / VPS）。\n");
+  if (!fixed && preferredSubdomain) {
+    console.log(`  提示             已排入后台重试，固定域名一旦可用会自动切过去`);
+  }
+  console.log("=".repeat(72));
+  console.log("\n保持本窗口开着；隧道断开会自动重连。Ctrl+C 结束。\n");
 
-  // Block until this session dies, then reconnect.
   await new Promise((resolve) => {
     if (!tunnel || tunnel.exitCode !== null) return resolve();
     tunnel.once("exit", resolve);
@@ -308,5 +364,5 @@ for (;;) {
 
   if (stopping) break;
   console.log("隧道断开，5 秒后自动重连…");
-  await new Promise((resolve) => setTimeout(resolve, 5000));
+  await sleep(RECONNECT_DELAY_MS);
 }
