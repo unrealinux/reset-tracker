@@ -1,0 +1,50 @@
+# Fly.io — persistent volume, no sleep, command-line deploy.
+#
+#   fly launch --no-deploy --copy-config     # keeps this file
+#   fly volumes create reset_data --size 1
+#   fly secrets set ADMIN_PASSWORD=... ADMIN_SECRET=... CRON_SECRET=...
+#   fly deploy
+#
+# The volume is what makes this worth the extra step over a free tier: the
+# SQLite file survives redeploys, so notification subscriptions are kept.
+
+app = "reset-tracker"
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "3000"
+  # Belt and braces: the Dockerfile already forces this at exec time, but Fly
+  # also injects a HOSTNAME, so be explicit.
+  HOSTNAME = "0.0.0.0"
+  DATA_DIR = "/app/data"
+  # min_machines_running is 1 below, so in-process ingestion is safe.
+  ENABLE_SCHEDULER = "1"
+  SCHEDULER_INTERVAL_MINUTES = "60"
+  SOURCE_CODEX_RESETS_API = "1"
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  # Keep one machine up so the scheduler keeps running. Setting
+  # auto_stop_machines = "suspend" saves money but stops ingestion between
+  # requests; if you do that, set ENABLE_SCHEDULER=0 and drive
+  # /api/cron/poll from an external cron instead.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 80
+    hard_limit = 100
+
+[[mounts]]
+  source = "reset_data"
+  destination = "/app/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

@@ -1,0 +1,22 @@
+# Normalise line endings in the repository. Without this, a Windows checkout
+# commits CRLF and the Dockerfile / shell snippets break on Linux with
+# "\r: not found".
+* text=auto eol=lf
+
+# Windows-only helpers keep their native endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be touched.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# Keep these out of diffs and language statistics.
+package-lock.json linguist-generated=true
+src/data/seed.ts linguist-generated=true

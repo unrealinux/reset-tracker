@@ -1,0 +1,80 @@
+# Render Blueprint — the fastest route to a public HTTPS URL.
+#
+#   1. push this repository to GitHub
+#   2. Render dashboard → New → Blueprint → pick the repo
+#   3. it reads this file, generates the secrets, and asks for ADMIN_PASSWORD
+#
+# Free plan notes:
+#   * The instance sleeps after ~15 minutes without traffic and wakes in ~30s.
+#   * There is no persistent disk on `free`, so a redeploy resets the database to
+#     the bundled snapshot (71 records). That is survivable here — the seed is
+#     complete and ingestion is idempotent — but notification subscriptions are
+#     lost. Switch to `starter` and uncomment the `disk:` block to keep them.
+#
+# Tip: point a free cron service (e.g. cron-job.org) at
+#   POST https://<your-app>.onrender.com/api/cron/poll
+#   header  x-cron-secret: <CRON_SECRET from the dashboard>
+# once an hour. That both refreshes the data and keeps the instance awake.
+
+services:
+  - type: web
+    name: reset-tracker
+    runtime: node
+    plan: free
+    region: singapore
+    autoDeploy: true
+    buildCommand: npm ci --no-audit --no-fund && npm run build
+    # `next start` reads PORT, which Render injects. Do not hardcode a port.
+    startCommand: npm start
+    healthCheckPath: /api/health
+
+    # Uncomment for a persistent database (requires plan: starter or higher).
+    # disk:
+    #   name: reset-data
+    #   mountPath: /opt/render/project/src/data
+    #   sizeGB: 1
+
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: DATA_DIR
+        value: ./data
+
+      # Public origin — set this to the URL Render gives you, or to your own
+      # domain. Used for canonical links, feeds and the VAPID audience.
+      - key: SITE_URL
+        sync: false
+
+      # Filled in for you on first deploy.
+      - key: CRON_SECRET
+        generateValue: true
+      - key: ADMIN_SECRET
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false
+
+      # Single instance → safe to ingest in-process.
+      - key: ENABLE_SCHEDULER
+        value: "1"
+      - key: SCHEDULER_INTERVAL_MINUTES
+        value: "60"
+      - key: SOURCE_CODEX_RESETS_API
+        value: "1"
+
+      # Optional extras — leave blank to disable that channel.
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:admin@example.com
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_CHANNEL_URL
+        sync: false
+      - key: SMTP_URL
+        sync: false
+      - key: MAIL_FROM
+        sync: false

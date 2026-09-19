@@ -1,0 +1,33 @@
+node_modules
+.next
+out
+build
+
+# Runtime state — must never be baked into an image
+data
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Local config and secrets
+.env
+.env.local
+.env.*.local
+
+# Repository metadata
+.git
+.gitignore
+.github
+
+# Not needed inside the image
+docs
+README.md
+Dockerfile
+.dockerignore
+docker-compose.yml
+render.yaml
+fly.toml
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+.DS_Store

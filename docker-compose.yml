@@ -1,0 +1,73 @@
+# One-command deploy: build the image, run it, keep the SQLite file on a volume.
+#
+#   cp .env.example .env          # then set the three required secrets below
+#   docker compose up -d --build
+#
+# Docker Compose reads `.env` from this directory automatically. The
+# `:?` markers below make it refuse to start if a secret is still unset, rather
+# than silently shipping the development default.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: reset-tracker:latest
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+
+    environment:
+      # --- required -------------------------------------------------------
+      SITE_URL: ${SITE_URL:-http://localhost:3000}
+      CRON_SECRET: ${CRON_SECRET:?set CRON_SECRET in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      ADMIN_SECRET: ${ADMIN_SECRET:?set ADMIN_SECRET in .env}
+
+      # --- storage --------------------------------------------------------
+      DATA_DIR: /app/data
+
+      # --- scheduling (single replica only) -------------------------------
+      ENABLE_SCHEDULER: "${ENABLE_SCHEDULER:-1}"
+      SCHEDULER_INTERVAL_MINUTES: "${SCHEDULER_INTERVAL_MINUTES:-60}"
+
+      # --- notifications (all optional) -----------------------------------
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:admin@example.com}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_CHANNEL_URL: ${TELEGRAM_CHANNEL_URL:-}
+      SMTP_URL: ${SMTP_URL:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+
+      # --- ingestion ------------------------------------------------------
+      SOURCE_CODEX_RESETS_API: "${SOURCE_CODEX_RESETS_API:-1}"
+      NITTER_BASE_URL: ${NITTER_BASE_URL:-}
+
+    volumes:
+      # Named volume: Docker copies the image's /app/data ownership (uid 1001)
+      # onto it, so SQLite can write immediately. A bind mount would need
+      # `chown -R 1001:1001 ./data` on the host instead.
+      - reset-data:/app/data
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    # SQLite is a single-writer store: keep one replica.
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  reset-data:
