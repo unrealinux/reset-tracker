@@ -22,3 +22,8 @@
 next-env.d.ts
 .DS_Store
 npm-debug.log*
+
+# Ad-hoc screenshots pasted from chat apps (WeChat, QQ, ...).
+/微信图片_*.png
+/微信截图_*.png
+/Screenshot_*.png
