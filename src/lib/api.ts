@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { NextResponse } from "next/server";
+import { config } from "./config";
 
 export interface ProblemDetails {
   type: string;
@@ -11,7 +12,31 @@ export interface ProblemDetails {
   parameter?: string;
 }
 
-const PROBLEM_BASE = "https://reset-tracker.dev/problems/";
+/**
+ * Every problem `code` this API can return. Kept here so the type URIs below
+ * and the error list rendered by /api/docs cannot drift apart.
+ */
+export const PROBLEM_CODES = [
+  "unauthorized",
+  "not_found",
+  "invalid_parameter",
+  "missing_parameter",
+  "invalid_body",
+  "invalid_channel",
+  "invalid_cursor",
+  "invalid_endpoint",
+  "invalid_keys",
+  "missing_target",
+  "rate_limited",
+] as const;
+
+/**
+ * RFC 9457 type URIs. They resolve to this deployment's own API reference and
+ * anchor at the matching `code`, so the identifier dereferences to a page that
+ * actually exists. It used to point at `reset-tracker.dev`, a domain nobody
+ * owns.
+ */
+const PROBLEM_BASE = `${config.siteUrl}/api/docs#`;
 
 export function requestId(): string {
   return crypto.randomBytes(8).toString("hex");

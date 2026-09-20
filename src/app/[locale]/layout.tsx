@@ -44,10 +44,16 @@ export async function generateMetadata({
     title: { default: t("site.title"), template: "%s | whenreset" },
     description: t("site.description"),
     applicationName: "whenreset",
+    // Without this the browser falls back to /favicon.ico, which does not
+    // exist, and the tab shows a blank icon.
+    icons: {
+      icon: [{ url: "/icon.svg", type: "image/svg+xml", sizes: "any" }],
+      shortcut: ["/icon.svg"],
+    },
     alternates: buildAlternates("/", locale),
     openGraph: {
       type: "website",
-      siteName: "whenreset.dev",
+      siteName: "whenreset",
       title: t("site.title"),
       description: t("site.description"),
       url: localizedPath("/", locale),
