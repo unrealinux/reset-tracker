@@ -1,11 +1,23 @@
-node_modules
-.next
-out
-build
-data
+# Dependencies and build output.
+# These patterns are anchored with a leading slash on purpose: a bare `data`
+# also matches `src/data/`, which silently dropped the bundled seed snapshot
+# from the repository and broke every clean build with
+# "Module not found: Can't resolve '../data/seed'".
+/node_modules
+/.next
+/out
+/build
+
+# Runtime state. The SQLite file is created here at boot and must never be
+# committed; `src/data/` is source code and is tracked.
+/data
+
+# Local configuration and secrets.
 .env
 .env.local
 .env*.local
+
+# Generated files.
 *.tsbuildinfo
 next-env.d.ts
 .DS_Store
