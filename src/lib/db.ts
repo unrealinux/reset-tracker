@@ -10,25 +10,66 @@ import {
   normalizeProvider,
   normalizeSourceType,
 } from "./classify";
+import type { StatementSync } from "node:sqlite";
 import type { ResetRecord, ResetType } from "./types";
 import { SCHEMA } from "./schema";
 import { seed } from "../data/seed";
-
-
 
 type GlobalWithDb = typeof globalThis & {
   __resetTrackerDb?: DatabaseSync;
   __resetTrackerSeeded?: boolean;
 };
-
 const g = globalThis as GlobalWithDb;
+
+// --- Prepared statement cache --------------------------------------------------
+
+// `db.prepare` compiles SQL on every call. The hot paths re-compile the same
+// handful of statements thousands of times per request (every repo read), so
+// compiled statements are cached per connection keyed by the SQL text. A
+// WeakMap keeps the cache from outliving the connection it belongs to —
+// important for scripts that open isolated databases.
+const preparedStatements = new WeakMap<DatabaseSync, Map<string, StatementSync>>();
+
+/** `db.prepare` with a per-connection statement cache; same SQL compiles once. */
+export function prepared(db: DatabaseSync, sql: string): StatementSync {
+  let bySql = preparedStatements.get(db);
+  if (!bySql) {
+    bySql = new Map();
+    preparedStatements.set(db, bySql);
+  }
+  let stmt = bySql.get(sql);
+  if (!stmt) {
+    stmt = db.prepare(sql);
+    bySql.set(sql, stmt);
+  }
+  return stmt;
+}
+
+// --- Record revision ------------------------------------------------------------
+
+/**
+ * Changes every time a reset row is written through this module. The repo layer
+ * folds it into its cache version so an in-process write is visible to the next
+ * read immediately, even when the database fingerprint below is unchanged (a
+ * write quantised to the same second as an earlier one).
+ */
+let recordRevision = 0;
+
+export function bumpRecordRevision(): void {
+  recordRevision += 1;
+}
+
+export function currentRecordRevision(): number {
+  return recordRevision;
+}
 
 function migrate(db: DatabaseSync) {
   db.exec(SCHEMA);
 }
 
 function upsertProviders(db: DatabaseSync) {
-  const stmt = db.prepare(
+  const stmt = prepared(
+    db,
     `INSERT INTO providers (id, name, vendor, blurb, accent, sort_order, sources,
        usage_url, usage_label, docs_url, status_url, enabled)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -106,7 +147,8 @@ export function completeRecord(row: SeedRow): ResetRecord {
 }
 
 export function insertRecord(db: DatabaseSync, record: ResetRecord): boolean {
-  const stmt = db.prepare(
+  const stmt = prepared(
+    db,
     `INSERT INTO resets (id, provider, reset_type, announced_at, applies_to,
        applies_to_detail, reason, reason_detail, text, source_type,
        source_author, source_url, follow_ups, status)
@@ -129,11 +171,14 @@ export function insertRecord(db: DatabaseSync, record: ResetRecord): boolean {
     JSON.stringify(record.followUps),
     record.status,
   );
-  return Number(res.changes) > 0;
+  const inserted = Number(res.changes) > 0;
+  if (inserted) bumpRecordRevision();
+  return inserted;
 }
 
 export function updateRecord(db: DatabaseSync, record: ResetRecord): boolean {
-  const stmt = db.prepare(
+  const stmt = prepared(
+    db,
     `UPDATE resets SET
        provider = ?, reset_type = ?, announced_at = ?, applies_to = ?,
        applies_to_detail = ?, reason = ?, reason_detail = ?, text = ?,
@@ -157,13 +202,15 @@ export function updateRecord(db: DatabaseSync, record: ResetRecord): boolean {
     record.status,
     record.id,
   );
-  return Number(res.changes) > 0;
+  const updated = Number(res.changes) > 0;
+  if (updated) bumpRecordRevision();
+  return updated;
 }
 
 export function seedDatabase(db: DatabaseSync, force = false) {
   migrate(db);
   upsertProviders(db);
-  const count = db.prepare("SELECT COUNT(*) AS n FROM resets").get() as { n: number };
+  const count = prepared(db, "SELECT COUNT(*) AS n FROM resets").get() as { n: number };
   if (count.n > 0 && !force) return { seeded: false, inserted: 0 };
 
   const rows = seed as unknown as SeedRow[];

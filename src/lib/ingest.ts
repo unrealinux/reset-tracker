@@ -1,4 +1,4 @@
-import { completeRecord, getDb, insertRecord, updateRecord, type SeedRow } from "./db";
+import { bumpRecordRevision, completeRecord, getDb, insertRecord, updateRecord, type SeedRow } from "./db";
 import { isFollowUpPost } from "./classify";
 import { dispatchReset, type NotifyResult } from "./notify";
 import { finishPoll, getReset, listResets, rowToRecord, startPoll } from "./repo";
@@ -257,7 +257,9 @@ export function mergeFollowUps(provider?: ProviderId): number {
 export function deleteRecord(id: string): boolean {
   const db = getDb();
   const result = db.prepare("DELETE FROM resets WHERE id = ?").run(id);
-  return Number(result.changes) > 0;
+  const deleted = Number(result.changes) > 0;
+  if (deleted) bumpRecordRevision();
+  return deleted;
 }
 
 export function rawRecordToRecord(row: unknown): ResetRecord {
