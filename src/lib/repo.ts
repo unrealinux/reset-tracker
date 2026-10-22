@@ -100,8 +100,11 @@ function buildWhere(query: ResetQuery) {
     params.push(new Date(query.to).toISOString());
   }
   if (query.q) {
-    clauses.push("(text LIKE ? OR reason_detail LIKE ? OR applies_to LIKE ? OR source_author LIKE ?)");
-    const like = `%${query.q}%`;
+    // Escape LIKE wildcards so a search for "50%" does not match "50x".
+    const like = `%${query.q.replace(/[\\%_]/g, "\\$&")}%`;
+    clauses.push(
+      "(text LIKE ? ESCAPE '\\' OR reason_detail LIKE ? ESCAPE '\\' OR applies_to LIKE ? ESCAPE '\\' OR source_author LIKE ? ESCAPE '\\')",
+    );
     params.push(like, like, like, like);
   }
   if (!query.includePending) clauses.push("status = 'confirmed'");
