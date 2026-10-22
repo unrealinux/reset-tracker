@@ -156,6 +156,14 @@ public/sw.js        service worker (offline shell + push)
 Dockerfile  docker-compose.yml  .dockerignore
 ```
 
+The record reads in `repo.ts` are served from a version-checked in-process
+cache: one fingerprint query (`COUNT`/`MAX` on `resets`) plus a write counter
+bumped by `insertRecord`/`updateRecord`/`deleteRecord`. Ingestion and admin
+writes invalidate it automatically; adding a new write path to the `resets`
+table should call `bumpRecordRevision()` too. Stats and forecasts read a
+dedicated lightweight query (`announced_at`, `reset_type` only) that is not
+capped at 500 rows.
+
 ## Configuration
 
 All of `.env.example` is optional; see that file for the full list. The values that change

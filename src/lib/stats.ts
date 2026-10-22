@@ -2,6 +2,13 @@ import type { Forecast, ResetRecord, ResetStats } from "./types";
 
 const DAY_MS = 86_400_000;
 
+/**
+ * The only fields the statistics, forecast and calendar actually read. Passing
+ * a lightweight `announcedAt`/`resetType` row instead of a full `ResetRecord`
+ * keeps the DB from shipping the announcement text for every historical row.
+ */
+export type StatRecord = Pick<ResetRecord, "announcedAt" | "resetType">;
+
 export function dayDiff(a: string | Date, b: string | Date): number {
   return (new Date(a).getTime() - new Date(b).getTime()) / DAY_MS;
 }
@@ -53,7 +60,7 @@ export function mad(values: number[]): number | null {
  * `includeBanked` controls whether reset-card grants break the waiting chain.
  */
 export function intervals(
-  records: ResetRecord[],
+  records: StatRecord[],
   options: { includeBanked?: boolean; limit?: number } = {},
 ): number[] {
   const { includeBanked = true, limit } = options;
@@ -69,7 +76,7 @@ export function intervals(
   return sliced.filter((v) => v > 0);
 }
 
-export function computeStats(records: ResetRecord[], now: Date = new Date()): ResetStats {
+export function computeStats(records: StatRecord[], now: Date = new Date()): ResetStats {
   const sorted = [...records].sort(
     (a, b) => +new Date(b.announcedAt) - +new Date(a.announcedAt),
   );
@@ -114,7 +121,7 @@ export function computeStats(records: ResetRecord[], now: Date = new Date()): Re
  * wildly is reported as low confidence even when the mean looks tidy.
  */
 export function forecast(
-  records: ResetRecord[],
+  records: StatRecord[],
   now: Date = new Date(),
   options: { includeBanked?: boolean } = {},
 ): Forecast {
@@ -191,7 +198,7 @@ export interface CalendarWeek {
  * Builds a GitHub-style contribution grid ending on the week containing `now`.
  */
 export function buildCalendar(
-  records: ResetRecord[],
+  records: StatRecord[],
   now: Date = new Date(),
   weeks = 26,
 ): CalendarWeek[] {

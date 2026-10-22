@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS resets (
 CREATE INDEX IF NOT EXISTS idx_resets_provider_time ON resets(provider, announced_at DESC);
 CREATE INDEX IF NOT EXISTS idx_resets_time ON resets(announced_at DESC);
 CREATE INDEX IF NOT EXISTS idx_resets_type ON resets(reset_type);
+CREATE INDEX IF NOT EXISTS idx_resets_provider_reason ON resets(provider, reason);
 
 CREATE TABLE IF NOT EXISTS watches (
   id                   INTEGER PRIMARY KEY AUTOINCREMENT,

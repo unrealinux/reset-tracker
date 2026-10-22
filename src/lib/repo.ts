@@ -1,6 +1,6 @@
-import { getDb } from "./db";
+import { getDb, prepared, currentRecordRevision } from "./db";
 import { PROVIDERS, getProvider } from "./providers";
-import { computeStats, forecast } from "./stats";
+import { computeStats, forecast, type StatRecord } from "./stats";
 import type {
   Provider,
   ProviderId,
@@ -75,6 +75,98 @@ export interface ResetQuery {
   cursorId?: string;
 }
 
+// --- Data version & read caches ----------------------------------------------
+
+interface CacheEntry<T> {
+  version: string;
+  value: T;
+}
+
+const statRowsCache = new Map<string, CacheEntry<StatRecord[]>>();
+const latestCache = new Map<string, CacheEntry<ResetRecord | null>>();
+const recordsCache = new Map<string, CacheEntry<ResetRecord[]>>();
+
+/**
+ * Fingerprint of the reset table plus this process's write counter.
+ *
+ * The row-level fingerprint (`COUNT`/`MAX(created_at)`/`MAX(updated_at)`)
+ * covers writes that happen outside this module — scripts, another replica in
+ * a dev session, the seed step. The in-process write counter (bumped by
+ * `insertRecord`/`updateRecord`/`deleteRecord`) catches two writes landing in
+ * the same wall-clock second, which the second-resolution timestamps alone
+ * cannot distinguish. Keeping the version check to one tiny query means the
+ * cache is version-checked, not TTL-guessed: it never serves stale records
+ * and it still amortises the heavy multi-hundred-row reads.
+ */
+export function recordVersion(): string {
+  const db = getDb();
+  const row = prepared(
+    db,
+    "SELECT COUNT(*) AS n, MAX(created_at) AS c, MAX(updated_at) AS u FROM resets",
+  ).get() as { n: number; c: string | null; u: string | null };
+  return `${row.n}:${row.c ?? ""}:${row.u ?? ""}:${currentRecordRevision()}`;
+}
+
+function cachedValue<T>(
+  store: Map<string, CacheEntry<T>>,
+  key: string,
+  version: string,
+  compute: () => T,
+): T {
+  const hit = store.get(key);
+  if (hit && hit.version === version) return hit.value;
+  const value = compute();
+  store.set(key, { version, value });
+  return value;
+}
+
+/** Drop the record-derived caches; used by callers that bulk-write outside repo. */
+export function invalidateRecordCaches(): void {
+  statRowsCache.clear();
+  latestCache.clear();
+  recordsCache.clear();
+}
+
+/**
+ * Reads every confirmed announcement for the statistics, forecast and calendar.
+ *
+ * Unlike the record readers this has intentionally no LIMIT: the rows come
+ * through `iterate()`, so the aggregation always sees the full history. The
+ * earlier `allResetsFor` path capped at 500, which would silently truncate the
+ * interval series once Codex's history outgrows it. Only the two columns the
+ * math needs are selected — no announcement text crosses the wire.
+ */
+export function statRowsFor(
+  provider?: ProviderId | "all",
+  includePending = false,
+): StatRecord[] {
+  const key = `${provider ?? "all"}:${includePending}`;
+  return cachedValue(statRowsCache, key, recordVersion(), () => {
+    const clauses: string[] = [];
+    const params: string[] = [];
+    if (provider && provider !== "all") {
+      clauses.push("provider = ?");
+      params.push(provider);
+    }
+    if (!includePending) clauses.push("status = 'confirmed'");
+    const sql = `SELECT announced_at, reset_type FROM resets ${
+      clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""
+    } ORDER BY announced_at DESC, id DESC`;
+    const stmt = prepared(getDb(), sql);
+    const out: StatRecord[] = [];
+    for (const row of stmt.iterate(...params) as IterableIterator<{
+      announced_at: string;
+      reset_type: string;
+    }>) {
+      out.push({
+        announcedAt: row.announced_at,
+        resetType: row.reset_type === "banked" ? "banked" : "regular",
+      });
+    }
+    return out;
+  });
+}
+
 function buildWhere(query: ResetQuery) {
   const order = query.order === "asc" ? "ASC" : "DESC";
   const clauses: string[] = [];
@@ -125,10 +217,10 @@ export function listResets(query: ResetQuery = {}): ResetRecord[] {
   const order = query.order === "asc" ? "ASC" : "DESC";
   const limit = Math.min(Math.max(query.limit ?? 50, 1), 500);
   const offset = Math.max(query.offset ?? 0, 0);
-  const rows = db
-    .prepare(
-      `SELECT * FROM resets ${where} ORDER BY announced_at ${order}, id ${order} LIMIT ? OFFSET ?`,
-    )
+  const rows = prepared(
+    db,
+    `SELECT * FROM resets ${where} ORDER BY announced_at ${order}, id ${order} LIMIT ? OFFSET ?`,
+  )
     .all(...params, limit, offset) as unknown as ResetRow[];
   return rows.map(rowToRecord);
 }
@@ -136,7 +228,10 @@ export function listResets(query: ResetQuery = {}): ResetRecord[] {
 export function countResets(query: ResetQuery = {}): number {
   const db = getDb();
   const { where, params } = buildWhere(query);
-  const row = db.prepare(`SELECT COUNT(*) AS n FROM resets ${where}`).get(...params) as {
+  const row = prepared(
+    db,
+    `SELECT COUNT(*) AS n FROM resets ${where}`,
+  ).get(...params) as {
     n: number;
   };
   return row.n;
@@ -146,12 +241,23 @@ export function allResetsFor(
   provider?: ProviderId | "all",
   includePending = false,
 ): ResetRecord[] {
-  return listResets({ provider, limit: 500, includePending });
+  const key = `${provider ?? "all"}:${includePending}`;
+  return cachedValue(recordsCache, key, recordVersion(), () => {
+    const out: ResetRecord[] = [];
+    // Paged past the 500-row single-query limit so a growing history is never
+    // silently truncated for the pages that render every record.
+    for (let offset = 0; ; offset += 500) {
+      const page = listResets({ provider, limit: 500, offset, includePending });
+      out.push(...page);
+      if (page.length < 500) break;
+    }
+    return out;
+  });
 }
 
 export function getReset(id: string): ResetRecord | null {
   const db = getDb();
-  const row = db.prepare("SELECT * FROM resets WHERE id = ?").get(id) as
+  const row = prepared(db, "SELECT * FROM resets WHERE id = ?").get(id) as
     | ResetRow
     | undefined;
   return row ? rowToRecord(row) : null;
@@ -165,18 +271,19 @@ export function reasonsFor(provider?: ProviderId | "all"): { reason: string; cou
     where += " AND provider = ?";
     params.push(provider);
   }
-  const rows = db
-    .prepare(`SELECT reason, COUNT(*) AS count FROM resets ${where} GROUP BY reason ORDER BY count DESC`)
-    .all(...params) as unknown as { reason: string; count: number }[];
+  const rows = prepared(
+    db,
+    `SELECT reason, COUNT(*) AS count FROM resets ${where} GROUP BY reason ORDER BY count DESC`,
+  ).all(...params) as unknown as { reason: string; count: number }[];
   return rows;
 }
 
 export function activeWatch(provider: ProviderId, now = new Date()): Watch | null {
   const db = getDb();
-  const row = db
-    .prepare(
-      `SELECT * FROM watches WHERE provider = ? AND expires_at > ? ORDER BY observed_at DESC LIMIT 1`,
-    )
+  const row = prepared(
+    db,
+    `SELECT * FROM watches WHERE provider = ? AND expires_at > ? ORDER BY observed_at DESC LIMIT 1`,
+  )
     .get(provider, now.toISOString()) as
     | {
         level: string;
@@ -204,10 +311,10 @@ export function activeWatch(provider: ProviderId, now = new Date()): Watch | nul
 
 export function scheduledReset(provider: ProviderId): ScheduledReset | null {
   const db = getDb();
-  const row = db
-    .prepare(
-      "SELECT * FROM scheduled_resets WHERE provider = ? AND active = 1 ORDER BY announced_at DESC LIMIT 1",
-    )
+  const row = prepared(
+    db,
+    "SELECT * FROM scheduled_resets WHERE provider = ? AND active = 1 ORDER BY announced_at DESC LIMIT 1",
+  )
     .get(provider) as
     | {
         id: string;
@@ -233,17 +340,27 @@ export function statsFor(
   provider?: ProviderId | "all",
   now = new Date(),
 ): ResetStats {
-  return computeStats(allResetsFor(provider), now);
+  return computeStats(statRowsFor(provider), now);
 }
 
 export function providerStatus(provider: Provider, now = new Date()): ProviderStatus {
-  const records = allResetsFor(provider.id);
-  const stats = computeStats(records, now);
+  const version = recordVersion();
+  const stats = computeStats(statRowsFor(provider.id), now);
+  // Only the newest record needs its full row (the announcement text etc.);
+  // everything else is served by the lightweight stats reader.
+  const latest = cachedValue(latestCache, provider.id, version, () => {
+    const db = getDb();
+    const row = prepared(
+      db,
+      "SELECT * FROM resets WHERE provider = ? AND status = 'confirmed' ORDER BY announced_at DESC, id DESC LIMIT 1",
+    ).get(provider.id) as ResetRow | undefined;
+    return row ? rowToRecord(row) : null;
+  });
   return {
     provider,
     stats,
-    forecast: forecast(records, now),
-    latest: records[0] ?? null,
+    forecast: forecast(statRowsFor(provider.id), now),
+    latest,
     watch: activeWatch(provider.id, now),
     scheduled: scheduledReset(provider.id),
   };
@@ -274,9 +391,7 @@ export function latestRecords(limit = 5): ResetRecord[] {
 
 export function listSubscribers(): Subscriber[] {
   const db = getDb();
-  const rows = db
-    .prepare("SELECT * FROM subscribers ORDER BY created_at DESC")
-    .all() as unknown as {
+  const rows = prepared(db, "SELECT * FROM subscribers ORDER BY created_at DESC").all() as unknown as {
     id: string;
     channel: Subscriber["channel"];
     provider: string;
@@ -308,7 +423,8 @@ export function getSubscriber(id: string): Subscriber | null {
 
 export function insertSubscriber(sub: Subscriber): void {
   const db = getDb();
-  db.prepare(
+  prepared(
+    db,
     `INSERT INTO subscribers (id, channel, provider, target, label, secret, verified, active, last_notified_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
@@ -331,11 +447,11 @@ export function insertSubscriber(sub: Subscriber): void {
 }
 
 export function setSubscriberActive(id: string, active: boolean): void {
-  getDb().prepare("UPDATE subscribers SET active = ? WHERE id = ?").run(active ? 1 : 0, id);
+  prepared(getDb(), "UPDATE subscribers SET active = ? WHERE id = ?").run(active ? 1 : 0, id);
 }
 
 export function deleteSubscriber(id: string): void {
-  getDb().prepare("DELETE FROM subscribers WHERE id = ?").run(id);
+  prepared(getDb(), "DELETE FROM subscribers WHERE id = ?").run(id);
 }
 
 export function subscribersFor(provider: ProviderId, channel?: Subscriber["channel"]): Subscriber[] {
@@ -349,9 +465,10 @@ export function subscribersFor(provider: ProviderId, channel?: Subscriber["chann
 
 export function alreadyDelivered(subscriberId: string, resetId: string): boolean {
   const db = getDb();
-  const row = db
-    .prepare("SELECT 1 AS x FROM deliveries WHERE subscriber_id = ? AND reset_id = ?")
-    .get(subscriberId, resetId);
+  const row = prepared(
+    db,
+    "SELECT 1 AS x FROM deliveries WHERE subscriber_id = ? AND reset_id = ?",
+  ).get(subscriberId, resetId);
   return Boolean(row);
 }
 
@@ -363,23 +480,26 @@ export function recordDelivery(
   detail?: string,
 ): void {
   const db = getDb();
-  db.prepare(
+  prepared(
+    db,
     `INSERT INTO deliveries (subscriber_id, reset_id, channel, status, detail)
      VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(subscriber_id, reset_id) DO UPDATE SET status = excluded.status, detail = excluded.detail`,
   ).run(subscriberId, resetId, channel, status, detail ?? null);
   if (status === "sent") {
-    db.prepare("UPDATE subscribers SET last_notified_at = datetime('now') WHERE id = ?").run(
-      subscriberId,
-    );
+    prepared(
+      db,
+      "UPDATE subscribers SET last_notified_at = datetime('now') WHERE id = ?",
+    ).run(subscriberId);
   }
 }
 
 export function deliveryStats(): { channel: string; status: string; count: number }[] {
   const db = getDb();
-  return db
-    .prepare("SELECT channel, status, COUNT(*) AS count FROM deliveries GROUP BY channel, status")
-    .all() as unknown as { channel: string; status: string; count: number }[];
+  return prepared(
+    db,
+    "SELECT channel, status, COUNT(*) AS count FROM deliveries GROUP BY channel, status",
+  ).all() as unknown as { channel: string; status: string; count: number }[];
 }
 
 // --- Push subscriptions ------------------------------------------------------
@@ -395,9 +515,7 @@ export interface PushSubscriptionRecord {
 
 export function listPushSubscriptions(): PushSubscriptionRecord[] {
   const db = getDb();
-  const rows = db
-    .prepare("SELECT * FROM push_subscriptions WHERE active = 1")
-    .all() as unknown as {
+  const rows = prepared(db, "SELECT * FROM push_subscriptions WHERE active = 1").all() as unknown as {
     endpoint: string;
     p256dh: string;
     auth: string;
@@ -422,18 +540,17 @@ export function savePushSubscription(input: {
   providers: string[];
   userAgent?: string | null;
 }): void {
-  getDb()
-    .prepare(
-      `INSERT INTO push_subscriptions (endpoint, p256dh, auth, providers, user_agent, active)
-       VALUES (?, ?, ?, ?, ?, 1)
-       ON CONFLICT(endpoint) DO UPDATE SET
-         p256dh = excluded.p256dh,
-         auth = excluded.auth,
-         providers = excluded.providers,
-         user_agent = excluded.user_agent,
-         active = 1`,
-    )
-    .run(
+  prepared(
+    getDb(),
+    `INSERT INTO push_subscriptions (endpoint, p256dh, auth, providers, user_agent, active)
+     VALUES (?, ?, ?, ?, ?, 1)
+     ON CONFLICT(endpoint) DO UPDATE SET
+       p256dh = excluded.p256dh,
+       auth = excluded.auth,
+       providers = excluded.providers,
+       user_agent = excluded.user_agent,
+       active = 1`,
+  ).run(
       input.endpoint,
       input.p256dh,
       input.auth,
@@ -443,15 +560,16 @@ export function savePushSubscription(input: {
 }
 
 export function removePushSubscription(endpoint: string): void {
-  getDb().prepare("UPDATE push_subscriptions SET active = 0 WHERE endpoint = ?").run(endpoint);
+  prepared(getDb(), "UPDATE push_subscriptions SET active = 0 WHERE endpoint = ?").run(endpoint);
 }
 
 // --- Ops ---------------------------------------------------------------------
 
 export function startPoll(db: DatabaseSync, source: string): number {
-  const res = db
-    .prepare("INSERT INTO polls (source, started_at) VALUES (?, ?)")
-    .run(source, new Date().toISOString());
+  const res = prepared(db, "INSERT INTO polls (source, started_at) VALUES (?, ?)").run(
+    source,
+    new Date().toISOString(),
+  );
   return Number(res.lastInsertRowid);
 }
 
@@ -460,7 +578,8 @@ export function finishPoll(
   id: number,
   result: { inserted: number; updated: number; skipped: number; error?: string },
 ): void {
-  db.prepare(
+  prepared(
+    db,
     `UPDATE polls SET finished_at = ?, inserted = ?, updated = ?, skipped = ?, error = ? WHERE id = ?`,
   ).run(
     new Date().toISOString(),
@@ -474,7 +593,10 @@ export function finishPoll(
 
 export function lastPoll() {
   const db = getDb();
-  return db.prepare("SELECT * FROM polls ORDER BY id DESC LIMIT 1").get() as
+  return prepared(
+    db,
+    "SELECT * FROM polls ORDER BY id DESC LIMIT 1",
+  ).get() as
     | {
         id: number;
         source: string;
@@ -489,15 +611,16 @@ export function lastPoll() {
 }
 
 export function audit(actor: string, action: string, detail?: string): void {
-  getDb()
-    .prepare("INSERT INTO audit_log (actor, action, detail) VALUES (?, ?, ?)")
-    .run(actor, action, detail ?? null);
+  prepared(
+    getDb(),
+    "INSERT INTO audit_log (actor, action, detail) VALUES (?, ?, ?)",
+  ).run(actor, action, detail ?? null);
 }
 
 export function recentAudit(limit = 25) {
-  return getDb()
-    .prepare("SELECT * FROM audit_log ORDER BY id DESC LIMIT ?")
-    .all(limit) as unknown as {
+  return prepared(getDb(), "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?").all(
+    limit,
+  ) as unknown as {
     id: number;
     at: string;
     actor: string;
@@ -507,16 +630,15 @@ export function recentAudit(limit = 25) {
 }
 
 export function getSetting(key: string): string | null {
-  const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get(key) as
+  const row = prepared(getDb(), "SELECT value FROM settings WHERE key = ?").get(key) as
     | { value: string }
     | undefined;
   return row?.value ?? null;
 }
 
 export function setSetting(key: string, value: string): void {
-  getDb()
-    .prepare(
-      "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .run(key, value);
+  prepared(
+    getDb(),
+    "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(key, value);
 }
